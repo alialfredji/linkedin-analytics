@@ -2,7 +2,8 @@
 """
 LinkedIn Analytics Extractor
 
-Connects to Chrome via CDP and extracts analytics into SQLite + JSON.
+Connects to LinkedIn via Playwright (headless Chromium) and extracts analytics into SQLite + JSON.
+Auth is handled via saved cookies or credential login (LINKEDIN_USERNAME + LINKEDIN_PASSWORD).
 
 Usage:
   python extract.py                                      # all metrics, past_7_days
@@ -16,6 +17,7 @@ Usage:
 import argparse
 import datetime
 import json
+import os
 import re
 import subprocess
 import sys
@@ -24,7 +26,6 @@ from pathlib import Path
 
 import sqlite_utils
 from playwright.sync_api import sync_playwright
-
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -59,54 +60,103 @@ ALL_METRICS = [
     "top_posts",
 ]
 
-DEFAULT_DB = Path(__file__).parent / "linkedin.db"
-CHROME_APP = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-CHROME_DEBUG_DIR = Path.home() / ".chrome-linkedin-debug"
+DEFAULT_DB = Path(os.environ.get("DB_PATH", str(Path(__file__).parent / "linkedin.db")))
+DEFAULT_DASHBOARD = Path(os.environ.get("DASHBOARD_PATH", str(Path(__file__).parent / "dashboard.html")))
+COOKIE_PATH = Path(os.environ.get("COOKIE_PATH", "/data/cookies.json"))
+LINKEDIN_USERNAME = os.environ.get("LINKEDIN_USERNAME", "")
+LINKEDIN_PASSWORD = os.environ.get("LINKEDIN_PASSWORD", "")
 
 
 # ---------------------------------------------------------------------------
-# Chrome helpers
+# Auth helpers
 # ---------------------------------------------------------------------------
 
 
-def chrome_running(port: int = 9222) -> bool:
-    import urllib.request
+def get_authenticated_page(p):
+    """Launch headless Chromium and return an authenticated (page, browser) tuple.
 
-    try:
-        urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=2)
-        return True
-    except Exception:
-        return False
-
-
-def launch_chrome(port: int = 9222) -> bool:
-    """Launch Chrome with CDP on given port using a persistent debug profile."""
-    CHROME_DEBUG_DIR.mkdir(exist_ok=True)
-    subprocess.Popen(
-        [
-            CHROME_APP,
-            "--headless=new",
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={CHROME_DEBUG_DIR}",
-            "--no-first-run",
-            "--no-default-browser-check",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    Auth strategy:
+    1. Try restoring saved cookies from COOKIE_PATH.
+    2. If cookies are stale/missing, fall back to credential login.
+    3. After successful credential login, persist cookies for next run.
+    """
+    browser = p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     )
-    for _ in range(20):
-        time.sleep(0.5)
-        if chrome_running(port):
-            return True
-    return False
+    context = browser.new_context(
+        user_agent=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        extra_http_headers={
+            'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            'sec-ch-ua-mobile': '?0',
+            'sec-ch-ua-platform': '"macOS"',
+        },
+    )
+    # Mask navigator.webdriver to reduce bot detection
+    context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+    page = context.new_page()
 
+    # --- Attempt 1: restore saved cookies ---
+    if COOKIE_PATH.exists():
+        try:
+            cookies = json.loads(COOKIE_PATH.read_text())
+            context.add_cookies(cookies)
+            page.goto(
+                "https://www.linkedin.com/feed/",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            page.wait_for_timeout(3000)
+            if page.query_selector('[role="main"]'):
+                print("  [auth] Cookie restore OK", file=sys.stderr)
+                return page, browser
+            print("  [auth] Cookies present but session invalid — retrying with credentials", file=sys.stderr)
+        except Exception as e:
+            print(f"  [auth] Cookie restore failed: {e}", file=sys.stderr)
 
-def get_page(p, cdp_port: int = 9222):
-    """Connect to running Chrome, return (page, browser)."""
-    browser = p.chromium.connect_over_cdp(f"http://localhost:{cdp_port}")
-    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-    return ctx.new_page(), browser
+    # --- Attempt 2: credential login ---
+    if not LINKEDIN_USERNAME or not LINKEDIN_PASSWORD:
+        print(
+            "  [auth] ERROR: No valid cookies and no credentials set.\n"
+            "         Set LINKEDIN_USERNAME + LINKEDIN_PASSWORD environment variables.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
+    print("  [auth] Logging in with credentials...", file=sys.stderr)
+    page.goto("https://www.linkedin.com/login", wait_until="domcontentloaded", timeout=30_000)
+    page.wait_for_timeout(2000)
+    page.fill("#username", LINKEDIN_USERNAME)
+    page.fill("#password", LINKEDIN_PASSWORD)
+    page.click("button[type='submit']")
+    page.wait_for_timeout(5000)
+
+    # Security challenge detection
+    if "/checkpoint" in page.url or "/challenge" in page.url:
+        print(
+            f"  [auth] ERROR: LinkedIn security challenge detected.\n"
+            f"         URL: {page.url}\n"
+            f"         Manual intervention required.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not page.query_selector('[role="main"]'):
+        print(f"  [auth] ERROR: Login failed. Current URL: {page.url}", file=sys.stderr)
+        sys.exit(1)
+
+    # Persist cookies for subsequent runs
+    COOKIE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COOKIE_PATH.write_text(json.dumps(context.cookies()))
+    print("  [auth] Credential login OK, cookies saved", file=sys.stderr)
+
+    return page, browser
 
 def nav(page, url: str, wait_ms: int = 5000):
     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
@@ -785,7 +835,6 @@ def main():
     )
     parser.add_argument("--output", default="both", choices=["json", "sqlite", "both"])
     parser.add_argument("--db-path", default=str(DEFAULT_DB))
-    parser.add_argument("--cdp-port", type=int, default=9222)
     parser.add_argument(
         "--dry-run", action="store_true", help="Print plan without scraping"
     )
@@ -810,20 +859,6 @@ def main():
         print(f"Plan: {requested} | period={args.period} | db={args.db_path}")
         return
 
-    # Ensure Chrome is running
-    if not chrome_running(args.cdp_port):
-        print(
-            f"Chrome not found on port {args.cdp_port}. Launching...", file=sys.stderr
-        )
-        if not launch_chrome(args.cdp_port):
-            print(
-                f"Failed. Start Chrome manually:\n"
-                f'  "{CHROME_APP}" --remote-debugging-port={args.cdp_port} '
-                f"--user-data-dir={CHROME_DEBUG_DIR}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
     today_date = datetime.date.today()
     today = today_date.isoformat()
     snapshot = {}
@@ -833,7 +868,7 @@ def main():
     demo_data = {}
 
     with sync_playwright() as p:
-        page, _browser = get_page(p, args.cdp_port)
+        page, _browser = get_authenticated_page(p)
         try:
             print(f"\nLinkedIn Analytics  date={today}  period={args.period}")
             print(f"Metrics: {requested}\n")
@@ -911,7 +946,7 @@ def main():
             save_posts(db, posts, today, period=args.period)
         for tp_list, tp_period in top_posts_by_period:
             save_posts(db, tp_list, today, period=tp_period)
-            save_posts(db, tp_list, today, period=tp_period)
+
         if demo_data:
             save_demographics(db, demo_data, today)
 
@@ -925,7 +960,7 @@ def main():
                     str(_script_dir / "dashboard_gen.py"),
                     "--no-open",
                     "--db", args.db_path,
-                    "--out", str(_script_dir / "dashboard.html"),
+                    "--out", str(DEFAULT_DASHBOARD),
                 ],
             )
 
