@@ -632,12 +632,12 @@ def generate_html(data: dict, pic_b64: str) -> str:
   </div>
 </div>
 
-{posts_section_html}
-
 <div class="section-label">Audience Demographics</div>
 <div class="demo-grid">
   {demo_panels_html}
 </div>
+
+{posts_section_html}
 
 <div class="footer">
   <img src="data:image/jpeg;base64,{pic_b64}" alt="Ali">

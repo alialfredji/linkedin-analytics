@@ -831,7 +831,7 @@ def main():
         "--metrics", default="all", help="Comma-separated list or 'all'"
     )
     parser.add_argument(
-        "--period", default="past_7_days", choices=list(PERIOD_DAYS.keys())
+        "--period", default="past_28_days", choices=list(PERIOD_DAYS.keys())
     )
     parser.add_argument("--output", default="both", choices=["json", "sqlite", "both"])
     parser.add_argument("--db-path", default=str(DEFAULT_DB))

@@ -33,7 +33,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && playwright install chromium \
     && playwright install-deps chromium
 
-COPY extract.py dashboard_gen.py ./
+COPY extract.py dashboard_gen.py serve.py ./
 
 # Data volume: cookies + SQLite db
 VOLUME ["/data"]
