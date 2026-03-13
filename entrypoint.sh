@@ -10,20 +10,20 @@ PERIOD="${PERIOD:-past_28_days}"
 
 export DB_PATH DASHBOARD_PATH COOKIE_PATH PERIOD
 
-# Write crontab
 CRON_FILE=/etc/cron.d/linkedin-analytics
-printf '%s root DB_PATH=%s DASHBOARD_PATH=%s COOKIE_PATH=%s LINKEDIN_USERNAME=%s LINKEDIN_PASSWORD=%s PERIOD=%s python /app/extract.py --period %s >> /proc/1/fd/1 2>&1\n' \
-    "$CRON_SCHEDULE" \
-    "$DB_PATH" \
-    "$DASHBOARD_PATH" \
-    "$COOKIE_PATH" \
-    "${LINKEDIN_USERNAME:-}" \
-    "${LINKEDIN_PASSWORD:-}" \
-    "${PERIOD}" \
-    "${PERIOD}" \
-    > "$CRON_FILE"
+{
+    printf 'PATH=/usr/local/bin:/usr/bin:/bin\n'
+    printf '%s root DB_PATH=%s DASHBOARD_PATH=%s COOKIE_PATH=%s LINKEDIN_USERNAME=%s LINKEDIN_PASSWORD=%s PERIOD=%s /usr/local/bin/python3 /app/extract.py --period %s >> /proc/1/fd/1 2>&1\n' \
+        "$CRON_SCHEDULE" \
+        "$DB_PATH" \
+        "$DASHBOARD_PATH" \
+        "$COOKIE_PATH" \
+        "${LINKEDIN_USERNAME:-}" \
+        "${LINKEDIN_PASSWORD:-}" \
+        "${PERIOD}" \
+        "${PERIOD}"
+} > "$CRON_FILE"
 chmod 0644 "$CRON_FILE"
-crontab "$CRON_FILE"
 
 # Run an initial extraction on first startup if DB doesn't exist yet
 if [ ! -f "$DB_PATH" ]; then
